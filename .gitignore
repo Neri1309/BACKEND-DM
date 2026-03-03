@@ -1,0 +1,12 @@
+# Node
+node_modules/
+**/node_modules/
+
+# Local data / sqlite
+data/
+**/data/
+*.db
+
+# secrets
+.env
+**/.env
