@@ -12,13 +12,11 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const TZ_DEFAULT = process.env.TZ_DEFAULT || "America/Mexico_City";
 
-// --- Ensure data dir exists ---
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const DB_PATH = path.join(DATA_DIR, "pill.db");
-
-// --- SQLite helpers (promisified) ---
 const db = new sqlite3.Database(DB_PATH);
 
+// --- SQLite helpers ---
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
@@ -42,6 +40,10 @@ function all(sql, params = []) {
       resolve(rows);
     });
   });
+}
+
+function clamp(x, a, b) {
+  return Math.max(a, Math.min(b, x));
 }
 
 // --- Init tables ---
@@ -68,36 +70,24 @@ async function init() {
     CREATE TABLE IF NOT EXISTS taken_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       device_id TEXT NOT NULL,
-      ts INTEGER NOT NULL,          -- epoch seconds
-      created_at INTEGER NOT NULL,  -- epoch seconds
+      ts INTEGER NOT NULL,          -- epoch seconds (from device)
+      created_at INTEGER NOT NULL,  -- epoch seconds (server)
       FOREIGN KEY (device_id) REFERENCES devices(device_id)
     );
   `);
 
-  // indexes
   await run(`CREATE INDEX IF NOT EXISTS idx_taken_device_ts ON taken_events(device_id, ts);`);
 }
 
-function clamp(x, a, b) {
-  return Math.max(a, Math.min(b, x));
-}
-
-/**
- * Compute risk of missing next dose for this (device, hour, minute).
- * Uses last N days expected doses inferred from schedule & taken_events.
- *
- * - If a scheduled dose is in the past (scheduled + grace <= now), it's "expected".
- * - It's "taken" if there's a taken_event in [scheduled - earlyWindow, scheduled + grace].
- * - Weighted by decay^(days_ago) so recent days count more.
- */
+// --- AI: infer misses from schedule & taken timestamps ---
 async function computeRisk({ deviceId, tz, hour, minute }) {
   const now = DateTime.now().setZone(tz);
-  const lookbackDays = 14;
-  const graceMin = 60;       // after schedule time, still counts as taken
-  const earlyMin = 10;       // allow slightly early confirmations
-  const decay = 0.93;        // recency weighting
 
-  // pull taken events for a bit more than lookback
+  const lookbackDays = 14;
+  const graceMin = 60;   // cuenta como "tomado" si confirma hasta 60 min tarde
+  const earlyMin = 10;   // y hasta 10 min antes
+  const decay = 0.93;    // peso por recencia
+
   const since = now.minus({ days: lookbackDays + 2 }).toSeconds();
   const takenRows = await all(
     `SELECT ts FROM taken_events WHERE device_id=? AND ts>=? ORDER BY ts ASC`,
@@ -105,17 +95,14 @@ async function computeRisk({ deviceId, tz, hour, minute }) {
   );
   const takenTs = takenRows.map(r => r.ts);
 
-  // helper: check if any taken event is within [a,b]
   function hasTakenInWindow(aSec, bSec) {
-    // takenTs is sorted; linear scan is ok for small volumes
-    // but we’ll do a simple binary-ish scan
+    // binary search for first >= aSec
     let lo = 0, hi = takenTs.length - 1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
       if (takenTs[mid] < aSec) lo = mid + 1;
       else hi = mid - 1;
     }
-    // lo is first >= aSec
     return lo < takenTs.length && takenTs[lo] <= bSec;
   }
 
@@ -127,7 +114,7 @@ async function computeRisk({ deviceId, tz, hour, minute }) {
     const sched = day.set({ hour, minute, second: 0, millisecond: 0 });
     const due = sched.plus({ minutes: graceMin });
 
-    // only count if it's already due in the past
+    // solo cuenta dosis que ya "vencieron"
     if (due > now) continue;
 
     const weight = Math.pow(decay, d);
@@ -138,20 +125,19 @@ async function computeRisk({ deviceId, tz, hour, minute }) {
     else wMiss += weight;
   }
 
-  // Beta prior (stabilizes small data)
+  // prior suave (evita extremos con pocos datos)
   const alpha0 = 3.0;
   const beta0 = 1.5;
 
   const pTake = (alpha0 + wTaken) / (alpha0 + beta0 + wTaken + wMiss);
   const risk = clamp(1 - pTake, 0, 1);
-
-  return { risk, pTake, wTaken, wMiss };
+  return { risk };
 }
 
-/** Map risk -> reminder policy fields used by firmware */
 function policyFromRisk(risk) {
-  const preMin = clamp(Math.round(5 + risk * 25), 5, 30);     // 5..30
-  const nag = clamp(Math.round(risk * 3), 0, 3);              // 0..3
+  // Ajusta esto como quieras
+  const preMin = clamp(Math.round(5 + risk * 25), 5, 30); // 5..30
+  const nag = clamp(Math.round(risk * 3), 0, 3);          // 0..3
   const repeatEveryMin =
     risk < 0.45 ? 0 :
     risk < 0.75 ? 5 :
@@ -163,7 +149,7 @@ function policyFromRisk(risk) {
 app.get("/", (req, res) => res.status(200).send("ok"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-// Set/replace schedule for a device (admin endpoint simple)
+// Admin: set schedule (1 vez o cuando cambies horarios)
 app.put("/api/schedule/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -176,10 +162,7 @@ app.put("/api/schedule/:deviceId", async (req, res) => {
       return res.status(400).json({ error: "Max 3 schedules supported (times.length <= 3)" });
     }
 
-    // ensure device exists
     await run(`INSERT OR IGNORE INTO devices(device_id, tz) VALUES (?, ?)`, [deviceId, TZ_DEFAULT]);
-
-    // replace schedules
     await run(`DELETE FROM schedules WHERE device_id=?`, [deviceId]);
 
     for (let i = 0; i < times.length; i++) {
@@ -201,12 +184,10 @@ app.put("/api/schedule/:deviceId", async (req, res) => {
   }
 });
 
-// Get schedule for firmware (includes AI policy fields)
+// Firmware: get schedule + AI params
 app.get("/api/schedule/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-
-    // device tz
     const dev = await get(`SELECT device_id, tz FROM devices WHERE device_id=?`, [deviceId]);
     const tz = dev?.tz || TZ_DEFAULT;
 
@@ -218,15 +199,8 @@ app.get("/api/schedule/:deviceId", async (req, res) => {
     const times = [];
     for (const row of baseTimes) {
       const { risk } = await computeRisk({ deviceId, tz, hour: row.hour, minute: row.minute });
-      const policy = policyFromRisk(risk);
-
-      times.push({
-        hour: row.hour,
-        minute: row.minute,
-        preMin: policy.preMin,
-        nag: policy.nag,
-        repeatEveryMin: policy.repeatEveryMin
-      });
+      const p = policyFromRisk(risk);
+      times.push({ hour: row.hour, minute: row.minute, ...p });
     }
 
     res.json({ deviceId, tz, times });
@@ -236,7 +210,7 @@ app.get("/api/schedule/:deviceId", async (req, res) => {
   }
 });
 
-// Receive "taken" confirmation (from ESP)
+// Firmware: confirm taken
 app.post("/api/taken", async (req, res) => {
   try {
     const deviceId = req.body?.deviceId;
@@ -246,20 +220,22 @@ app.post("/api/taken", async (req, res) => {
       return res.status(400).json({ error: "deviceId required" });
     }
 
-    // allow missing timestamp -> use server time
-    if (!ts || typeof ts !== "number") {
-      ts = Math.floor(Date.now() / 1000);
-    } else {
-      ts = Math.floor(ts);
-    }
+    if (!ts || typeof ts !== "number") ts = Math.floor(Date.now() / 1000);
+    ts = Math.floor(ts);
 
-    // ensure device exists
     await run(`INSERT OR IGNORE INTO devices(device_id, tz) VALUES (?, ?)`, [deviceId, TZ_DEFAULT]);
 
-    await run(
-      `INSERT INTO taken_events(device_id, ts, created_at) VALUES (?, ?, ?)`,
-      [deviceId, ts, Math.floor(Date.now() / 1000)]
+    // dedup simple: si ya hay un evento en +/- 90s, no insertes otro
+    const existing = await get(
+      `SELECT id FROM taken_events WHERE device_id=? AND ts BETWEEN ? AND ? LIMIT 1`,
+      [deviceId, ts - 90, ts + 90]
     );
+    if (!existing) {
+      await run(
+        `INSERT INTO taken_events(device_id, ts, created_at) VALUES (?, ?, ?)`,
+        [deviceId, ts, Math.floor(Date.now() / 1000)]
+      );
+    }
 
     res.json({ ok: true });
   } catch (e) {
@@ -268,7 +244,7 @@ app.post("/api/taken", async (req, res) => {
   }
 });
 
-// Debug: view recent taken history
+// Debug
 app.get("/api/history/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
