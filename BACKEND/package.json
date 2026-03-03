@@ -1,5 +1,5 @@
 {
-  "name": "pill-dispenser-backend",
+  "name": "backend-dm-ai",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
